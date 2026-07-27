@@ -1,0 +1,9 @@
+[Unit]
+Description=Story clustering pass over new news enrichments
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/docker exec indexer-postgres-1 sh -c 'psql -U $POSTGRES_USER -d $POSTGRES_DB -c "SELECT * FROM atproto.cluster_stories();"'
+User=root
