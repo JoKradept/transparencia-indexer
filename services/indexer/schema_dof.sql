@@ -842,9 +842,18 @@ returns void language sql as $$
   delete from dof.notes          where uri = p_uri;
 $$;
 
-create or replace function dof.delete_note_enrichment_json(p_note_uri text)
-returns void language sql as $$
-  delete from dof.note_locations where note_uri = p_note_uri;
-  delete from dof.note_entities  where note_uri = p_note_uri;
-  delete from dof.enrichments    where note_uri = p_note_uri;
-$$;
+-- Delete keyed by the enrichment record URI (what tap gives us on a delete
+-- event). Resolves to the note_uri via dof.enrichments, then removes it +
+-- its children.
+create or replace function dof.delete_note_enrichment_json(p_enrichment_uri text)
+returns void language plpgsql as $$
+declare
+  v_note_uri text;
+begin
+  select note_uri into v_note_uri
+  from dof.enrichments where enrichment_uri = p_enrichment_uri;
+  if v_note_uri is null then return; end if;
+  delete from dof.note_locations where note_uri = v_note_uri;
+  delete from dof.note_entities  where note_uri = v_note_uri;
+  delete from dof.enrichments    where note_uri = v_note_uri;
+end $$;

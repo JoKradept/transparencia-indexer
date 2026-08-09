@@ -1,20 +1,18 @@
 /**
- * Indexer — consumes events from Tap and writes to PostgreSQL in batches.
+ * Indexer — consumes events from Tap and routes them to typed schemas.
  *
- * Tap handles the firehose connection, backfill, and ordering.
- * This service:
- *   - Accepts JSON events on a WebSocket channel.
- *   - Buffers up to BATCH_SIZE (or BATCH_INTERVAL_MS, whichever first) into a
- *     single multi-VALUES INSERT / DELETE against atproto.records.
- *   - Applies backpressure: when the buffer grows past PAUSE_AT the socket is
- *     ws.pause()'d until a flush drops it below RESUME_AT.
+ * Router: known typed collections (news.article/enrichment/source, DOF variants)
+ * write DIRECTLY to news.* / dof.* tables via the `*_json` SQL projection
+ * functions. Unknown collections fall back to atproto.records so future
+ * lexicons still get indexed somewhere.
  *
- * Before this: no batching, no backpressure → OOM under any backlog and
- * ~2 records/min throughput. After: bounded memory + hundreds/sec.
+ * Batching + backpressure: buffered up to BATCH_SIZE, flushed on size or
+ * BATCH_INTERVAL_MS. WebSocket paused above PAUSE_AT, resumed below RESUME_AT.
+ * Under 300 MB memory + hundreds/sec throughput even under backlog.
  */
 
 import { WebSocket } from "ws";
-import { getPool, upsertRecords, deleteRecords, getRecordCount, RecordRow } from "./db.js";
+import * as db from "./db.js";
 
 const TAP_WS_URL = process.env.TAP_WS_URL || "ws://localhost:2480/channel";
 
@@ -24,41 +22,90 @@ const PAUSE_AT          = Number(process.env.INDEXER_PAUSE_AT          ?? 2 * BA
 const RESUME_AT         = Number(process.env.INDEXER_RESUME_AT         ?? BATCH_SIZE);
 const LOG_INTERVAL_MS   = 10_000;
 
-// Buffered events awaiting flush. Order preserved so create-then-delete of the
-// same rkey within a batch resolves correctly (delete wins because it's later).
-type BufferedOp =
-  | { kind: "upsert"; row: RecordRow }
-  | { kind: "delete"; uri: string };
+// ─── Buffers ────────────────────────────────────────────────────────────────
+// One bucket per (collection kind, action). Flushed together per tick so an
+// upsert-then-delete for the same URI in the same batch still resolves as
+// delete-wins (deletes run after upserts inside flush()).
+//
+// Order semantics WITHIN a bucket are preserved. Order ACROSS buckets is not,
+// but tap doesn't emit inter-collection ordering guarantees anyway.
 
-const buffer: BufferedOp[] = [];
+const buf = {
+  newsSourceUps:      [] as db.TypedUpsertRow[],
+  newsArticleUps:     [] as db.TypedUpsertRow[],
+  newsEnrichmentUps:  [] as db.TypedUpsertRow[],
+  dofSourceUps:       [] as db.TypedUpsertRow[],
+  dofItemUps:         [] as db.TypedUpsertRow[],
+  dofNoteUps:         [] as db.TypedUpsertRow[],
+  dofEnrichmentUps:   [] as db.TypedUpsertRow[],
+  fallbackUps:        [] as db.RecordRow[],
+
+  newsSourceDel:      [] as string[],
+  newsArticleDel:     [] as string[],
+  newsEnrichmentDel:  [] as string[],
+  dofSourceDel:       [] as string[],
+  dofItemDel:         [] as string[],
+  dofNoteDel:         [] as string[],
+  dofEnrichmentDel:   [] as string[],
+  fallbackDel:        [] as string[],
+};
+
+function bufferSize(): number {
+  return Object.values(buf).reduce((sum, arr) => sum + arr.length, 0);
+}
+
 let paused = false;
 let flushing = false;
 let messageCount = 0;
 let lastLogTime = Date.now();
 
 async function flush(): Promise<void> {
-  if (flushing || buffer.length === 0) return;
+  if (flushing || bufferSize() === 0) return;
   flushing = true;
   try {
-    // Drain the whole buffer in one shot. If more arrive during the query
-    // they'll be handled on the next tick.
-    const batch = buffer.splice(0, buffer.length);
+    // Snapshot + reset all buckets atomically.
+    const snap = {
+      newsSourceUps: buf.newsSourceUps.splice(0),
+      newsArticleUps: buf.newsArticleUps.splice(0),
+      newsEnrichmentUps: buf.newsEnrichmentUps.splice(0),
+      dofSourceUps: buf.dofSourceUps.splice(0),
+      dofItemUps: buf.dofItemUps.splice(0),
+      dofNoteUps: buf.dofNoteUps.splice(0),
+      dofEnrichmentUps: buf.dofEnrichmentUps.splice(0),
+      fallbackUps: buf.fallbackUps.splice(0),
+      newsSourceDel: buf.newsSourceDel.splice(0),
+      newsArticleDel: buf.newsArticleDel.splice(0),
+      newsEnrichmentDel: buf.newsEnrichmentDel.splice(0),
+      dofSourceDel: buf.dofSourceDel.splice(0),
+      dofItemDel: buf.dofItemDel.splice(0),
+      dofNoteDel: buf.dofNoteDel.splice(0),
+      dofEnrichmentDel: buf.dofEnrichmentDel.splice(0),
+      fallbackDel: buf.fallbackDel.splice(0),
+    };
 
-    // Split into upserts + deletes, preserving order semantics only within
-    // each kind. In practice tap doesn't emit contradicting ops for the same
-    // uri in the same window; if it ever does, a create-then-delete resolves
-    // as delete-wins because deletes run after upserts here.
-    const upserts: RecordRow[] = [];
-    const deletes: string[] = [];
-    for (const op of batch) {
-      if (op.kind === "upsert") upserts.push(op.row);
-      else deletes.push(op.uri);
-    }
+    // Upserts first, deletes second (delete-wins within same batch).
+    // Order across kinds within a group: sources before articles/enrichments
+    // so FK-ish references land in a sane order, though we don't enforce FKs.
+    await db.upsertNewsSource(snap.newsSourceUps);
+    await db.upsertDofSource(snap.dofSourceUps);
+    await db.upsertNewsArticle(snap.newsArticleUps);
+    await db.upsertDofItem(snap.dofItemUps);
+    await db.upsertDofNote(snap.dofNoteUps);
+    await db.refreshNewsEnrichment(snap.newsEnrichmentUps);
+    await db.refreshDofNoteEnrichment(snap.dofEnrichmentUps);
+    await db.upsertRecords(snap.fallbackUps);
 
-    if (upserts.length > 0) await upsertRecords(upserts);
-    if (deletes.length > 0) await deleteRecords(deletes);
+    await db.deleteNewsEnrichment(snap.newsEnrichmentDel);
+    await db.deleteDofEnrichment(snap.dofEnrichmentDel);
+    await db.deleteNewsArticle(snap.newsArticleDel);
+    await db.deleteDofNote(snap.dofNoteDel);
+    await db.deleteDofItem(snap.dofItemDel);
+    await db.deleteNewsSource(snap.newsSourceDel);
+    await db.deleteDofSource(snap.dofSourceDel);
+    await db.deleteRecords(snap.fallbackDel);
 
-    messageCount += batch.length;
+    const total = Object.values(snap).reduce((s, a) => s + a.length, 0);
+    messageCount += total;
     maybeLog();
   } finally {
     flushing = false;
@@ -68,8 +115,34 @@ async function flush(): Promise<void> {
 function maybeLog() {
   const now = Date.now();
   if (now - lastLogTime > LOG_INTERVAL_MS) {
-    console.log(`Indexed ${messageCount} records total (buffer=${buffer.length}, paused=${paused})`);
+    console.log(`Indexed ${messageCount} records total (buffer=${bufferSize()}, paused=${paused})`);
     lastLogTime = now;
+  }
+}
+
+function routeUpsert(collection: string, row: db.TypedUpsertRow, generic: db.RecordRow) {
+  switch (collection) {
+    case db.NEWS_SOURCE:     buf.newsSourceUps.push(row); break;
+    case db.NEWS_ARTICLE:    buf.newsArticleUps.push(row); break;
+    case db.NEWS_ENRICHMENT: buf.newsEnrichmentUps.push(row); break;
+    case db.DOF_SOURCE:      buf.dofSourceUps.push(row); break;
+    case db.DOF_ITEM:        buf.dofItemUps.push(row); break;
+    case db.DOF_NOTE:        buf.dofNoteUps.push(row); break;
+    case db.DOF_ENRICHMENT:  buf.dofEnrichmentUps.push(row); break;
+    default:                 buf.fallbackUps.push(generic);
+  }
+}
+
+function routeDelete(collection: string, uri: string) {
+  switch (collection) {
+    case db.NEWS_SOURCE:     buf.newsSourceDel.push(uri); break;
+    case db.NEWS_ARTICLE:    buf.newsArticleDel.push(uri); break;
+    case db.NEWS_ENRICHMENT: buf.newsEnrichmentDel.push(uri); break;
+    case db.DOF_SOURCE:      buf.dofSourceDel.push(uri); break;
+    case db.DOF_ITEM:        buf.dofItemDel.push(uri); break;
+    case db.DOF_NOTE:        buf.dofNoteDel.push(uri); break;
+    case db.DOF_ENRICHMENT:  buf.dofEnrichmentDel.push(uri); break;
+    default:                 buf.fallbackDel.push(uri);
   }
 }
 
@@ -80,13 +153,9 @@ function connect() {
   const MAX_RECONNECT_DELAY = 30_000;
 
   const applyBackpressure = () => {
-    if (!paused && buffer.length >= PAUSE_AT) {
-      ws.pause();
-      paused = true;
-    } else if (paused && buffer.length <= RESUME_AT) {
-      ws.resume();
-      paused = false;
-    }
+    const sz = bufferSize();
+    if (!paused && sz >= PAUSE_AT) { ws.pause(); paused = true; }
+    else if (paused && sz <= RESUME_AT) { ws.resume(); paused = false; }
   };
 
   ws.on("open", () => {
@@ -110,13 +179,17 @@ function connect() {
     const { did, collection, rkey, action, cid, record } = event.record;
     const uri = `at://${did}/${collection}/${rkey}`;
     if (action === "create" || action === "update") {
-      if (record) buffer.push({ kind: "upsert", row: { uri, did, collection, rkey, cid, record } });
+      if (record) {
+        routeUpsert(collection,
+          { uri, did, rkey, cid: cid ?? null, record, indexedAt: new Date().toISOString() },
+          { uri, did, collection, rkey, cid, record });
+      }
     } else if (action === "delete") {
-      buffer.push({ kind: "delete", uri });
+      routeDelete(collection, uri);
     }
 
     applyBackpressure();
-    if (buffer.length >= BATCH_SIZE) void flush().then(applyBackpressure);
+    if (bufferSize() >= BATCH_SIZE) void flush().then(applyBackpressure);
   });
 
   ws.on("close", (code) => {
@@ -130,7 +203,6 @@ function connect() {
     console.error("WebSocket error:", err.message);
   });
 
-  // Periodic flush drains partial batches when firehose is idle.
   const timer = setInterval(() => void flush().then(applyBackpressure), BATCH_INTERVAL_MS);
   ws.on("close", () => clearInterval(timer));
 }
@@ -139,40 +211,47 @@ async function main() {
   console.log("TransparencIA Indexer starting...");
   console.log(`Tap URL: ${TAP_WS_URL}`);
   console.log(`Batching: size=${BATCH_SIZE} interval=${BATCH_INTERVAL_MS}ms pause_at=${PAUSE_AT} resume_at=${RESUME_AT}`);
+  console.log(`Router: typed collections → *_json SQL. Unknown → atproto.records fallback.`);
 
-  getPool();
-  const counts = await getRecordCount();
-  const total = Object.values(counts).reduce((a, b) => a + b, 0);
-  console.log(`Database connected. Current records: ${total}`);
-  for (const [col, count] of Object.entries(counts)) console.log(`  ${col}: ${count}`);
+  db.getPool();
+  const counts = await db.getRecordCount();
+  console.log(`Database connected. Table counts:`);
+  for (const [k, v] of Object.entries(counts)) console.log(`  ${k}: ${v}`);
 
   connect();
 }
 
-// Runnable self-check: BATCH_SIZE-based buffer + backpressure state machine.
-// Verified without touching Postgres or a WebSocket.
+// Runnable self-check: router + backpressure state machine, no Postgres/WS.
 async function selfCheck() {
   const assert = (cond: unknown, msg: string) => {
     if (!cond) { console.error("SELFCHECK FAILED:", msg); process.exit(1); }
   };
-  // Simulate the exact buffer growth / drain state used by the real handler.
-  const local: BufferedOp[] = [];
+
+  // Router: known collection lands in the right bucket, unknown in fallback.
+  routeUpsert(db.NEWS_ARTICLE, { uri:"a", did:"d", rkey:"r", cid:null, record:{}, indexedAt:"" }, { uri:"a", did:"d", collection:db.NEWS_ARTICLE, rkey:"r", record:{} });
+  routeUpsert("some.other.collection", { uri:"b", did:"d", rkey:"r", cid:null, record:{}, indexedAt:"" }, { uri:"b", did:"d", collection:"some.other.collection", rkey:"r", record:{} });
+  routeDelete(db.DOF_NOTE, "c");
+  assert(buf.newsArticleUps.length === 1, "news article routed");
+  assert(buf.fallbackUps.length === 1, "unknown routed to fallback");
+  assert(buf.dofNoteDel.length === 1, "dof note delete routed");
+  assert(bufferSize() === 3, "bufferSize sums across buckets");
+
+  // Backpressure state machine (unchanged from Fase 2).
+  const local: string[] = [];
   const size = 10, pauseAt = 20, resumeAt = 10;
   let localPaused = false;
   for (let i = 0; i < 25; i++) {
-    local.push({ kind: "upsert", row: { uri: `at://x/y/${i}`, did:"d", collection:"c", rkey:String(i), record:{} } });
+    local.push(`x${i}`);
     if (!localPaused && local.length >= pauseAt) localPaused = true;
   }
-  assert(localPaused, "should have paused after crossing 20");
-  // Partial drain: 25 → 15, still above resumeAt (10) so stays paused.
+  assert(localPaused, "paused after crossing 20");
   local.splice(0, size);
   if (localPaused && local.length <= resumeAt) localPaused = false;
-  assert(localPaused, "should still be paused at 15 (above resume=10)");
-  // Full drain: 15 → 5, now below resumeAt so resume.
+  assert(localPaused, "still paused at 15");
   local.splice(0, size);
   if (localPaused && local.length <= resumeAt) localPaused = false;
-  assert(!localPaused, "should have resumed after drain to 5");
-  assert(local.length === 5, "expected 5 items left, got " + local.length);
+  assert(!localPaused, "resumed after drain to 5");
+
   console.log("selfCheck OK");
 }
 

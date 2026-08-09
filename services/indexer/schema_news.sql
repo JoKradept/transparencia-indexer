@@ -675,9 +675,18 @@ returns void language sql as $$
   delete from news.articles          where uri = p_uri;
 $$;
 
-create or replace function news.delete_enrichment_json(p_article_uri text)
-returns void language sql as $$
-  delete from news.article_locations where article_uri = p_article_uri;
-  delete from news.article_entities  where article_uri = p_article_uri;
-  delete from news.enrichments       where article_uri = p_article_uri;
-$$;
+-- Delete keyed by the enrichment record URI (what tap gives us on a delete
+-- event). Resolves to the article_uri via news.enrichments, then removes the
+-- projected row and its children.
+create or replace function news.delete_enrichment_json(p_enrichment_uri text)
+returns void language plpgsql as $$
+declare
+  v_article_uri text;
+begin
+  select article_uri into v_article_uri
+  from news.enrichments where enrichment_uri = p_enrichment_uri;
+  if v_article_uri is null then return; end if;
+  delete from news.article_locations where article_uri = v_article_uri;
+  delete from news.article_entities  where article_uri = v_article_uri;
+  delete from news.enrichments       where article_uri = v_article_uri;
+end $$;
