@@ -611,3 +611,240 @@ begin
        lateral jsonb_array_elements(e.record->'people') with ordinality as t(en, ord)
   where jsonb_typeof(e.record->'people') = 'array';
 end $$;
+-- ============================================================================
+-- dof direct projection: mirrors news direct functions for the DOF lexicons.
+-- ============================================================================
+
+create or replace function dof.upsert_source_json(
+  p_uri text, p_did text, p_cid text, p_record jsonb, p_indexed_at timestamptz
+) returns void language sql as $$
+  insert into dof.sources (uri, did, cid, name, display_name, base_url,
+                           country, language, record, indexed_at)
+  values (
+    p_uri, p_did, p_cid,
+    p_record->>'name', p_record->>'displayName', p_record->>'baseUrl',
+    p_record->>'country', p_record->>'language',
+    p_record, p_indexed_at
+  )
+  on conflict (uri) do update set
+    did=excluded.did, cid=excluded.cid, name=excluded.name,
+    display_name=excluded.display_name, base_url=excluded.base_url,
+    country=excluded.country, language=excluded.language,
+    record=excluded.record, indexed_at=excluded.indexed_at;
+$$;
+
+create or replace function dof.upsert_item_json(
+  p_uri text, p_did text, p_rkey text, p_cid text, p_record jsonb, p_indexed_at timestamptz
+) returns void language sql as $$
+  insert into dof.items (uri, did, rkey, cid, source_uri, title, subtitle,
+    description, document_type, language, country, jurisdiction,
+    published_at, issued_at, effective_at, domains, topics,
+    retrieval_url, canonical_url, html_url, pdf_url, mime_type, sha256,
+    size_bytes, access_type, retrieved_at, issuing_bodies, identifiers,
+    created_at, record, indexed_at)
+  values (
+    p_uri, p_did, p_rkey, p_cid,
+    p_record->'source'->>'uri',
+    p_record->>'title', p_record->>'subtitle', p_record->>'description',
+    p_record->>'documentType', p_record->>'language', p_record->>'country',
+    p_record->>'jurisdiction',
+    nullif(p_record->>'publishedAt','')::timestamptz,
+    nullif(p_record->>'issuedAt','')::timestamptz,
+    nullif(p_record->>'effectiveAt','')::timestamptz,
+    case when jsonb_typeof(p_record->'domains')='array'
+         then array(select jsonb_array_elements_text(p_record->'domains')) end,
+    case when jsonb_typeof(p_record->'topics')='array'
+         then array(select jsonb_array_elements_text(p_record->'topics')) end,
+    p_record->'retrieval'->>'url', p_record->'retrieval'->>'canonicalUrl',
+    p_record->'retrieval'->>'htmlUrl', p_record->'retrieval'->>'pdfUrl',
+    p_record->'retrieval'->>'mimeType', p_record->'retrieval'->>'sha256',
+    nullif(p_record->'retrieval'->>'sizeBytes','')::bigint,
+    p_record->'retrieval'->>'accessType',
+    nullif(p_record->'retrieval'->>'retrievedAt','')::timestamptz,
+    case when jsonb_typeof(p_record->'issuingBodies')='array' then p_record->'issuingBodies' end,
+    case when jsonb_typeof(p_record->'identifiers')='array' then p_record->'identifiers' end,
+    nullif(p_record->>'createdAt','')::timestamptz,
+    p_record, p_indexed_at
+  )
+  on conflict (uri) do update set
+    did=excluded.did, rkey=excluded.rkey, cid=excluded.cid,
+    source_uri=excluded.source_uri, title=excluded.title, subtitle=excluded.subtitle,
+    description=excluded.description, document_type=excluded.document_type,
+    language=excluded.language, country=excluded.country, jurisdiction=excluded.jurisdiction,
+    published_at=excluded.published_at, issued_at=excluded.issued_at,
+    effective_at=excluded.effective_at, domains=excluded.domains, topics=excluded.topics,
+    retrieval_url=excluded.retrieval_url, canonical_url=excluded.canonical_url,
+    html_url=excluded.html_url, pdf_url=excluded.pdf_url, mime_type=excluded.mime_type,
+    sha256=excluded.sha256, size_bytes=excluded.size_bytes, access_type=excluded.access_type,
+    retrieved_at=excluded.retrieved_at, issuing_bodies=excluded.issuing_bodies,
+    identifiers=excluded.identifiers, created_at=excluded.created_at,
+    record=excluded.record, indexed_at=excluded.indexed_at;
+$$;
+
+create or replace function dof.upsert_note_json(
+  p_uri text, p_did text, p_rkey text, p_cid text, p_record jsonb, p_indexed_at timestamptz
+) returns void language plpgsql as $$
+begin
+  insert into dof.notes (uri, did, rkey, cid, item_uri, cod_nota, cod_diario,
+    edition, cod_seccion, dependencia, organismo, issuing_authority, authority_level,
+    tipo_nota, document_class, page, page_until, order_num,
+    has_html, has_pdf, has_doc, has_image, content_text_available,
+    pdf_storage_path, raw_imported_at, created_at, record, indexed_at)
+  values (
+    p_uri, p_did, p_rkey, p_cid,
+    p_record->'item'->>'uri',
+    nullif(p_record->>'codNota','')::bigint,
+    nullif(p_record->>'codDiario','')::bigint,
+    p_record->>'edition', p_record->>'codSeccion',
+    p_record->>'dependencia', p_record->>'organismo',
+    p_record->>'issuingAuthority', p_record->>'authorityLevel',
+    p_record->>'tipoNota', p_record->>'documentClass',
+    nullif(p_record->>'page','')::int, nullif(p_record->>'pageUntil','')::int,
+    p_record->>'order',
+    nullif(p_record->>'hasHtml','')::boolean,
+    nullif(p_record->>'hasPdf','')::boolean,
+    nullif(p_record->>'hasDoc','')::boolean,
+    nullif(p_record->>'hasImage','')::boolean,
+    nullif(p_record->>'contentTextAvailable','')::boolean,
+    p_record->>'pdfStoragePath',
+    nullif(p_record->>'rawImportedAt','')::timestamptz,
+    nullif(p_record->>'createdAt','')::timestamptz,
+    p_record, p_indexed_at
+  )
+  on conflict (uri) do update set
+    did=excluded.did, rkey=excluded.rkey, cid=excluded.cid, item_uri=excluded.item_uri,
+    cod_nota=excluded.cod_nota, cod_diario=excluded.cod_diario, edition=excluded.edition,
+    cod_seccion=excluded.cod_seccion, dependencia=excluded.dependencia,
+    organismo=excluded.organismo, issuing_authority=excluded.issuing_authority,
+    authority_level=excluded.authority_level, tipo_nota=excluded.tipo_nota,
+    document_class=excluded.document_class, page=excluded.page, page_until=excluded.page_until,
+    order_num=excluded.order_num, has_html=excluded.has_html, has_pdf=excluded.has_pdf,
+    has_doc=excluded.has_doc, has_image=excluded.has_image,
+    content_text_available=excluded.content_text_available,
+    pdf_storage_path=excluded.pdf_storage_path, raw_imported_at=excluded.raw_imported_at,
+    created_at=excluded.created_at, record=excluded.record, indexed_at=excluded.indexed_at;
+  update dof.enrichments e set published_at = n.created_at
+  from dof.notes n where n.uri = e.note_uri and e.note_uri = p_uri;
+end $$;
+
+create or replace function dof.refresh_note_enrichment_json(
+  p_note_uri text, p_enrichment_uri text, p_did text, p_cid text,
+  p_record jsonb, p_indexed_at timestamptz
+) returns void language plpgsql as $$
+declare
+  v_existing_indexed_at timestamptz;
+  v_pub timestamptz;
+begin
+  if p_note_uri is null then return; end if;
+
+  select indexed_at into v_existing_indexed_at
+  from dof.enrichments where note_uri = p_note_uri;
+
+  if v_existing_indexed_at is not null and v_existing_indexed_at >= p_indexed_at then
+    return;
+  end if;
+
+  delete from dof.note_locations where note_uri = p_note_uri;
+  delete from dof.note_entities  where note_uri = p_note_uri;
+
+  select created_at into v_pub from dof.notes where uri = p_note_uri;
+
+  insert into dof.enrichments (note_uri, enrichment_uri, did, cid, summary,
+    neutral_headline, tipo_acto, document_class, sector, impact_level, impact_reasoning,
+    legal_effects, obligations, compliance_items, effective_date, effective_date_text,
+    topics, target_entities, related_references, structured_refs, timeline,
+    content_domain, event_type, region, geographic_scope, source_authority_level,
+    reading_level, language, model_used, model_version, input_tokens, output_tokens,
+    cost_usd, created_at, published_at, record, indexed_at)
+  values (p_note_uri, p_enrichment_uri, p_did, p_cid, p_record->>'summary',
+    p_record->>'neutralHeadline', p_record->>'tipoActo', p_record->>'documentClass',
+    p_record->>'sector', nullif(p_record->>'impactLevel','')::int, p_record->>'impactReasoning',
+    case when jsonb_typeof(p_record->'legalEffects')='array'
+         then array(select jsonb_array_elements_text(p_record->'legalEffects')) end,
+    case when jsonb_typeof(p_record->'obligations')='array' then p_record->'obligations' end,
+    case when jsonb_typeof(p_record->'complianceItems')='array' then p_record->'complianceItems' end,
+    nullif(p_record->>'effectiveDate','')::timestamptz, p_record->>'effectiveDateText',
+    case when jsonb_typeof(p_record->'topics')='array'
+         then array(select jsonb_array_elements_text(p_record->'topics')) end,
+    case when jsonb_typeof(p_record->'targetEntities')='array'
+         then array(select jsonb_array_elements_text(p_record->'targetEntities')) end,
+    case when jsonb_typeof(p_record->'relatedReferences')='array' then p_record->'relatedReferences' end,
+    case when jsonb_typeof(p_record->'structuredRefs')='array' then p_record->'structuredRefs' end,
+    case when jsonb_typeof(p_record->'timeline')='array' then p_record->'timeline' end,
+    p_record->>'contentDomain', p_record->>'eventType', p_record->>'region',
+    p_record->>'geographicScope', p_record->>'sourceAuthorityLevel', p_record->>'readingLevel',
+    p_record->>'language', p_record->>'modelUsed', p_record->>'modelVersion',
+    nullif(p_record->>'inputTokens','')::int, nullif(p_record->>'outputTokens','')::int,
+    nullif(p_record->>'costUsd','')::numeric,
+    nullif(p_record->>'createdAt','')::timestamptz, v_pub, p_record, p_indexed_at)
+  on conflict (note_uri) do update set
+    enrichment_uri=excluded.enrichment_uri, did=excluded.did, cid=excluded.cid,
+    summary=excluded.summary, neutral_headline=excluded.neutral_headline,
+    tipo_acto=excluded.tipo_acto, document_class=excluded.document_class,
+    sector=excluded.sector, impact_level=excluded.impact_level,
+    impact_reasoning=excluded.impact_reasoning, legal_effects=excluded.legal_effects,
+    obligations=excluded.obligations, compliance_items=excluded.compliance_items,
+    effective_date=excluded.effective_date, effective_date_text=excluded.effective_date_text,
+    topics=excluded.topics, target_entities=excluded.target_entities,
+    related_references=excluded.related_references, structured_refs=excluded.structured_refs,
+    timeline=excluded.timeline, content_domain=excluded.content_domain,
+    event_type=excluded.event_type, region=excluded.region,
+    geographic_scope=excluded.geographic_scope,
+    source_authority_level=excluded.source_authority_level,
+    reading_level=excluded.reading_level, language=excluded.language,
+    model_used=excluded.model_used, model_version=excluded.model_version,
+    input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens,
+    cost_usd=excluded.cost_usd, created_at=excluded.created_at,
+    published_at=excluded.published_at, record=excluded.record, indexed_at=excluded.indexed_at;
+
+  insert into dof.note_locations (note_uri, idx, name, state, country,
+    country_code, relevance, lat, lng)
+  select p_note_uri, (ord-1)::int, loc->>'name', loc->>'state', loc->>'country',
+    upper(nullif(loc->>'countryCode','')), loc->>'relevance',
+    nullif(loc->>'lat','')::double precision, nullif(loc->>'lng','')::double precision
+  from jsonb_array_elements(p_record->'locations') with ordinality as t(loc, ord)
+  where jsonb_typeof(p_record->'locations') = 'array';
+
+  insert into dof.note_entities (note_uri, kind, idx, name, entity_id,
+    entity_id_type, role, sector, relevance, sentiment, sentiment_score)
+  select p_note_uri, 'organization', (ord-1)::int, e->>'name', e->>'entityId',
+    e->>'entityIdType', e->>'role', e->>'sector', e->>'relevance', e->>'sentiment',
+    nullif(e->>'sentimentScore','')::numeric
+  from jsonb_array_elements(p_record->'organizationEntities') with ordinality as t(e, ord)
+  where jsonb_typeof(p_record->'organizationEntities') = 'array';
+
+  insert into dof.note_entities (note_uri, kind, idx, name, entity_id,
+    entity_id_type, role, sector, relevance, sentiment, sentiment_score)
+  select p_note_uri, 'person', (ord-1)::int, e->>'name', e->>'entityId',
+    e->>'entityIdType', e->>'role', e->>'sector', e->>'relevance', e->>'sentiment',
+    nullif(e->>'sentimentScore','')::numeric
+  from jsonb_array_elements(p_record->'people') with ordinality as t(e, ord)
+  where jsonb_typeof(p_record->'people') = 'array';
+end $$;
+
+-- Delete helpers: 1 round-trip cascade for the indexer's delete-event handler.
+
+create or replace function dof.delete_source_json(p_uri text)
+returns void language sql as $$
+  delete from dof.sources where uri = p_uri;
+$$;
+
+create or replace function dof.delete_item_json(p_uri text)
+returns void language sql as $$
+  delete from dof.items where uri = p_uri;
+$$;
+
+create or replace function dof.delete_note_json(p_uri text)
+returns void language sql as $$
+  delete from dof.note_locations where note_uri = p_uri;
+  delete from dof.note_entities  where note_uri = p_uri;
+  delete from dof.enrichments    where note_uri = p_uri;
+  delete from dof.notes          where uri = p_uri;
+$$;
+
+create or replace function dof.delete_note_enrichment_json(p_note_uri text)
+returns void language sql as $$
+  delete from dof.note_locations where note_uri = p_note_uri;
+  delete from dof.note_entities  where note_uri = p_note_uri;
+  delete from dof.enrichments    where note_uri = p_note_uri;
+$$;

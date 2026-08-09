@@ -515,3 +515,169 @@ begin
   select e.article_uri, 'person', (ord-1)::int, en->>'name', en->>'entityId', en->>'entityIdType', en->>'role', en->>'sector', en->>'relevance', en->>'sentiment', nullif(en->>'sentimentScore','')::numeric
   from news.enrichments e, lateral jsonb_array_elements(e.record->'people') with ordinality as t(en, ord) where jsonb_typeof(e.record->'people') = 'array';
 end $$;
+-- ============================================================================
+-- news direct projection: functions that accept the record JSONB as a parameter
+-- ----------------------------------------------------------------------------
+-- Enables the indexer to project events into the news.* tables WITHOUT first
+-- writing to atproto.records. Each _json variant mirrors the extraction logic
+-- of the equivalent atproto-reading upsert (single source of truth for how
+-- fields map lives in the same file, just duplicated once here vs there).
+--
+-- Enrichment ordering: refresh_article_enrichment_json only overwrites if the
+-- incoming event is >= the currently-stored indexed_at. Out-of-order events
+-- from a resync-then-catchup won't downgrade a newer enrichment.
+--
+-- Deletes: delete_*_json wrap the cascade the trigger used to do, so the
+-- indexer can `perform news.delete_article_json(uri)` on a delete event and
+-- get children cleaned up in one round-trip.
+-- ============================================================================
+
+create or replace function news.upsert_source_json(
+  p_uri text, p_did text, p_cid text, p_record jsonb, p_indexed_at timestamptz
+) returns void language sql as $$
+  insert into news.sources (uri, did, cid, name, display_name, base_url,
+                            country, language, cms, feed_urls, created_at, record, indexed_at)
+  values (
+    p_uri, p_did, p_cid,
+    p_record->>'name', p_record->>'displayName', p_record->>'baseUrl',
+    p_record->>'country', p_record->>'language', p_record->>'cms',
+    p_record->'feedUrls',
+    nullif(p_record->>'createdAt','')::timestamptz,
+    p_record, p_indexed_at
+  )
+  on conflict (uri) do update set
+    did=excluded.did, cid=excluded.cid, name=excluded.name,
+    display_name=excluded.display_name, base_url=excluded.base_url,
+    country=excluded.country, language=excluded.language, cms=excluded.cms,
+    feed_urls=excluded.feed_urls, created_at=excluded.created_at,
+    record=excluded.record, indexed_at=excluded.indexed_at;
+$$;
+
+create or replace function news.upsert_article_json(
+  p_uri text, p_did text, p_rkey text, p_cid text, p_record jsonb, p_indexed_at timestamptz
+) returns void language plpgsql as $$
+begin
+  insert into news.articles (uri, did, rkey, cid, source_uri, title, url, guid,
+                             author, image_url, language, feed_category, tags,
+                             published_at, created_at, record, indexed_at)
+  values (
+    p_uri, p_did, p_rkey, p_cid,
+    p_record->'source'->>'uri',
+    p_record->>'title', p_record->>'url', p_record->>'guid', p_record->>'author',
+    p_record->>'imageUrl', p_record->>'language', p_record->>'feedCategory',
+    case when jsonb_typeof(p_record->'tags')='array' then p_record->'tags' end,
+    nullif(p_record->>'publishedAt','')::timestamptz,
+    nullif(p_record->>'createdAt','')::timestamptz,
+    p_record, p_indexed_at
+  )
+  on conflict (uri) do update set
+    did=excluded.did, rkey=excluded.rkey, cid=excluded.cid,
+    source_uri=excluded.source_uri, title=excluded.title, url=excluded.url,
+    guid=excluded.guid, author=excluded.author, image_url=excluded.image_url,
+    language=excluded.language, feed_category=excluded.feed_category,
+    tags=excluded.tags, published_at=excluded.published_at,
+    created_at=excluded.created_at, record=excluded.record, indexed_at=excluded.indexed_at;
+  -- keep denormalized published_at on the enrichment in sync
+  update news.enrichments e set published_at = a.published_at
+  from news.articles a
+  where a.uri = e.article_uri and e.article_uri = p_uri;
+end $$;
+
+create or replace function news.refresh_article_enrichment_json(
+  p_article_uri text, p_enrichment_uri text, p_did text, p_cid text,
+  p_record jsonb, p_indexed_at timestamptz
+) returns void language plpgsql as $$
+declare
+  v_existing_indexed_at timestamptz;
+  v_pub timestamptz;
+begin
+  if p_article_uri is null then return; end if;
+
+  select indexed_at into v_existing_indexed_at
+  from news.enrichments where article_uri = p_article_uri;
+
+  -- Older/equal event: skip. Prevents a resync from downgrading a fresher row.
+  if v_existing_indexed_at is not null and v_existing_indexed_at >= p_indexed_at then
+    return;
+  end if;
+
+  delete from news.article_locations where article_uri = p_article_uri;
+  delete from news.article_entities  where article_uri = p_article_uri;
+
+  select published_at into v_pub from news.articles where uri = p_article_uri;
+
+  insert into news.enrichments (article_uri, enrichment_uri, did, cid, summary,
+    neutral_headline, political_orientation, orientation_confidence, emotional_tone,
+    impact_level, clickbait_score, fact_checkability, content_domain, event_type,
+    region, reading_level, language, topics, model_used, cost_usd, created_at,
+    published_at, record, indexed_at)
+  values (p_article_uri, p_enrichment_uri, p_did, p_cid, p_record->>'summary',
+    p_record->>'neutralHeadline', p_record->>'politicalOrientation',
+    nullif(p_record->>'orientationConfidence','')::numeric, p_record->>'emotionalTone',
+    nullif(p_record->>'impactLevel','')::int, nullif(p_record->>'clickbaitScore','')::int,
+    nullif(p_record->>'factCheckability','')::int, p_record->>'contentDomain',
+    p_record->>'eventType', p_record->>'region', p_record->>'readingLevel',
+    p_record->>'language',
+    case when jsonb_typeof(p_record->'topics')='array'
+         then array(select jsonb_array_elements_text(p_record->'topics')) end,
+    p_record->>'modelUsed', nullif(p_record->>'costUsd','')::numeric,
+    nullif(p_record->>'createdAt','')::timestamptz, v_pub, p_record, p_indexed_at)
+  on conflict (article_uri) do update set
+    enrichment_uri=excluded.enrichment_uri, did=excluded.did, cid=excluded.cid,
+    summary=excluded.summary, neutral_headline=excluded.neutral_headline,
+    political_orientation=excluded.political_orientation,
+    orientation_confidence=excluded.orientation_confidence,
+    emotional_tone=excluded.emotional_tone, impact_level=excluded.impact_level,
+    clickbait_score=excluded.clickbait_score, fact_checkability=excluded.fact_checkability,
+    content_domain=excluded.content_domain, event_type=excluded.event_type,
+    region=excluded.region, reading_level=excluded.reading_level,
+    language=excluded.language, topics=excluded.topics, model_used=excluded.model_used,
+    cost_usd=excluded.cost_usd, created_at=excluded.created_at,
+    published_at=excluded.published_at, record=excluded.record, indexed_at=excluded.indexed_at;
+
+  insert into news.article_locations (article_uri, idx, name, state, country,
+    country_code, relevance, lat, lng)
+  select p_article_uri, (ord-1)::int, loc->>'name', loc->>'state', loc->>'country',
+    upper(nullif(loc->>'countryCode','')), loc->>'relevance',
+    nullif(loc->>'lat','')::double precision, nullif(loc->>'lng','')::double precision
+  from jsonb_array_elements(p_record->'locations') with ordinality as t(loc, ord)
+  where jsonb_typeof(p_record->'locations') = 'array';
+
+  insert into news.article_entities (article_uri, kind, idx, name, entity_id,
+    entity_id_type, role, sector, relevance, sentiment, sentiment_score)
+  select p_article_uri, 'organization', (ord-1)::int, e->>'name', e->>'entityId',
+    e->>'entityIdType', e->>'role', e->>'sector', e->>'relevance', e->>'sentiment',
+    nullif(e->>'sentimentScore','')::numeric
+  from jsonb_array_elements(p_record->'organizationEntities') with ordinality as t(e, ord)
+  where jsonb_typeof(p_record->'organizationEntities') = 'array';
+
+  insert into news.article_entities (article_uri, kind, idx, name, entity_id,
+    entity_id_type, role, sector, relevance, sentiment, sentiment_score)
+  select p_article_uri, 'person', (ord-1)::int, e->>'name', e->>'entityId',
+    e->>'entityIdType', e->>'role', e->>'sector', e->>'relevance', e->>'sentiment',
+    nullif(e->>'sentimentScore','')::numeric
+  from jsonb_array_elements(p_record->'people') with ordinality as t(e, ord)
+  where jsonb_typeof(p_record->'people') = 'array';
+end $$;
+
+-- Delete helpers: 1 round-trip cascade for the indexer's delete-event handler.
+
+create or replace function news.delete_source_json(p_uri text)
+returns void language sql as $$
+  delete from news.sources where uri = p_uri;
+$$;
+
+create or replace function news.delete_article_json(p_uri text)
+returns void language sql as $$
+  delete from news.article_locations where article_uri = p_uri;
+  delete from news.article_entities  where article_uri = p_uri;
+  delete from news.enrichments       where article_uri = p_uri;
+  delete from news.articles          where uri = p_uri;
+$$;
+
+create or replace function news.delete_enrichment_json(p_article_uri text)
+returns void language sql as $$
+  delete from news.article_locations where article_uri = p_article_uri;
+  delete from news.article_entities  where article_uri = p_article_uri;
+  delete from news.enrichments       where article_uri = p_article_uri;
+$$;
