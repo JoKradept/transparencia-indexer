@@ -678,6 +678,9 @@ $$;
 -- Delete keyed by the enrichment record URI (what tap gives us on a delete
 -- event). Resolves to the article_uri via news.enrichments, then removes the
 -- projected row and its children.
+-- Drop-then-create because the parameter name changed from the earlier
+-- p_article_uri variant (Postgres treats param names as part of the signature).
+drop function if exists news.delete_enrichment_json(text);
 create or replace function news.delete_enrichment_json(p_enrichment_uri text)
 returns void language plpgsql as $$
 declare

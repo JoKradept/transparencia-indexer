@@ -845,6 +845,9 @@ $$;
 -- Delete keyed by the enrichment record URI (what tap gives us on a delete
 -- event). Resolves to the note_uri via dof.enrichments, then removes it +
 -- its children.
+-- Drop-then-create because the parameter name changed from the earlier
+-- p_note_uri variant.
+drop function if exists dof.delete_note_enrichment_json(text);
 create or replace function dof.delete_note_enrichment_json(p_enrichment_uri text)
 returns void language plpgsql as $$
 declare
