@@ -68,19 +68,22 @@ DECLARE
   cnt_new       int := 0;
   cnt_joined    int := 0;
 BEGIN
+  -- Reads news.enrichments (typed read-model). Requires the news schema
+  -- from services/indexer/schema_news.sql. Under the Fase 3b router,
+  -- atproto.records no longer receives enrichment writes, so scanning it
+  -- here would miss everything published after the cutover.
   FOR r IN
-    SELECT (rec.record->'article'->>'uri') AS article_uri,
-           (rec.record->>'createdAt')::timestamptz AS created,
+    SELECT rec.article_uri AS article_uri,
+           rec.created_at  AS created,
            atproto.enrichment_bag(rec.record) AS bag
-    FROM atproto.records rec
-    WHERE rec.collection = 'tech.transparencia.news.enrichment'
-      AND (rec.record->>'createdAt')::timestamptz >= since
-      AND (rec.record->'article'->>'uri') IS NOT NULL
+    FROM news.enrichments rec
+    WHERE rec.created_at >= since
+      AND rec.article_uri IS NOT NULL
       AND NOT EXISTS (
         SELECT 1 FROM atproto.article_story s
-        WHERE s.article_uri = (rec.record->'article'->>'uri')
+        WHERE s.article_uri = rec.article_uri
       )
-    ORDER BY (rec.record->>'createdAt')::timestamptz ASC
+    ORDER BY rec.created_at ASC
   LOOP
     cnt_processed := cnt_processed + 1;
     IF cardinality(r.bag) < min_bag_size THEN
