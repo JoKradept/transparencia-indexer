@@ -11,4 +11,5 @@ WORKDIR /app
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/node_modules ./node_modules
 COPY package.json ./
+COPY schema_news.sql schema_dof.sql ./
 CMD ["node", "dist/index.js"]
