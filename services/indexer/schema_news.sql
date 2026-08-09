@@ -4,8 +4,9 @@
 -- Ported from transparencia-web-v2/migrations/2026-06-04-news-readmodel.sql
 -- (originally designed for Supabase). Adapted for the indexer's Postgres:
 --   - Dropped SECURITY DEFINER + search_path (no Supabase Auth here).
---   - Remapped extensions.* postgis functions to public schema.
 --   - Dropped RLS + anon/authenticated grants (single-tenant DB).
+--   - Dropped postgis geom column + geo indexes (base postgres:16 image has
+--     no postgis; lat/lng columns remain for future geo upgrade).
 --
 -- atproto.records (fed by the indexer from the AT Protocol firehose) is the
 -- source of truth today. Everything in schema `news` is derived and disposable:
@@ -16,8 +17,6 @@
 --   jsonb runtime extraction on atproto.records .......................... 27,469 ms
 --   flat indexed read-model ................................................ 182 ms
 -- ============================================================================
-
-create extension if not exists postgis;
 
 create schema if not exists news;
 
@@ -104,7 +103,6 @@ create table if not exists news.article_locations (
   relevance    text,
   lat          double precision,
   lng          double precision,
-  geom         geography(Point, 4326),
   primary key (article_uri, idx)
 );
 
@@ -140,7 +138,6 @@ create index if not exists idx_news_enr_topics           on news.enrichments usi
 create index if not exists idx_news_loc_country          on news.article_locations (country_code);
 create index if not exists idx_news_loc_state            on news.article_locations (lower(state));
 create index if not exists idx_news_loc_relevance        on news.article_locations (relevance);
-create index if not exists idx_news_loc_geom             on news.article_locations using gist (geom);
 
 create index if not exists idx_news_ent_entity_id        on news.article_entities (entity_id);
 create index if not exists idx_news_ent_name             on news.article_entities (lower(name));
@@ -258,13 +255,10 @@ begin
     record=excluded.record, indexed_at=excluded.indexed_at;
 
   insert into news.article_locations (article_uri, idx, name, state, country,
-    country_code, relevance, lat, lng, geom)
+    country_code, relevance, lat, lng)
   select p_article_uri, (ord-1)::int, loc->>'name', loc->>'state', loc->>'country',
     upper(nullif(loc->>'countryCode','')), loc->>'relevance',
-    nullif(loc->>'lat','')::double precision, nullif(loc->>'lng','')::double precision,
-    case when nullif(loc->>'lat','') is not null and nullif(loc->>'lng','') is not null
-         then st_setsrid(st_makepoint((loc->>'lng')::double precision,
-                                      (loc->>'lat')::double precision), 4326)::geography end
+    nullif(loc->>'lat','')::double precision, nullif(loc->>'lng','')::double precision
   from jsonb_array_elements(v_rec->'locations') with ordinality as t(loc, ord)
   where jsonb_typeof(v_rec->'locations') = 'array';
 
@@ -376,13 +370,10 @@ begin
   order by r.record->'article'->>'uri', r.indexed_at desc nulls last;
 
   insert into news.article_locations (article_uri, idx, name, state, country,
-    country_code, relevance, lat, lng, geom)
+    country_code, relevance, lat, lng)
   select e.article_uri, (ord-1)::int, loc->>'name', loc->>'state', loc->>'country',
     upper(nullif(loc->>'countryCode','')), loc->>'relevance',
-    nullif(loc->>'lat','')::double precision, nullif(loc->>'lng','')::double precision,
-    case when nullif(loc->>'lat','') is not null and nullif(loc->>'lng','') is not null
-         then st_setsrid(st_makepoint((loc->>'lng')::double precision,
-                                      (loc->>'lat')::double precision), 4326)::geography end
+    nullif(loc->>'lat','')::double precision, nullif(loc->>'lng','')::double precision
   from news.enrichments e,
        lateral jsonb_array_elements(e.record->'locations') with ordinality as t(loc, ord)
   where jsonb_typeof(e.record->'locations') = 'array';
@@ -487,8 +478,8 @@ begin
   insert into news.enrichments (article_uri, enrichment_uri, did, cid, summary, neutral_headline, political_orientation, orientation_confidence, emotional_tone, impact_level, clickbait_score, fact_checkability, content_domain, event_type, region, reading_level, language, topics, model_used, cost_usd, created_at, published_at, record, indexed_at)
   values (p_article_uri, v_uri, v_did, v_cid, v_rec->>'summary', v_rec->>'neutralHeadline', v_rec->>'politicalOrientation', nullif(v_rec->>'orientationConfidence','')::numeric, v_rec->>'emotionalTone', nullif(v_rec->>'impactLevel','')::int, nullif(v_rec->>'clickbaitScore','')::int, nullif(v_rec->>'factCheckability','')::int, v_rec->>'contentDomain', v_rec->>'eventType', v_rec->>'region', v_rec->>'readingLevel', v_rec->>'language', case when jsonb_typeof(v_rec->'topics')='array' then array(select jsonb_array_elements_text(v_rec->'topics')) end, v_rec->>'modelUsed', nullif(v_rec->>'costUsd','')::numeric, nullif(v_rec->>'createdAt','')::timestamptz, v_pub, v_rec, v_indexed)
   on conflict (article_uri) do update set enrichment_uri=excluded.enrichment_uri, did=excluded.did, cid=excluded.cid, summary=excluded.summary, neutral_headline=excluded.neutral_headline, political_orientation=excluded.political_orientation, orientation_confidence=excluded.orientation_confidence, emotional_tone=excluded.emotional_tone, impact_level=excluded.impact_level, clickbait_score=excluded.clickbait_score, fact_checkability=excluded.fact_checkability, content_domain=excluded.content_domain, event_type=excluded.event_type, region=excluded.region, reading_level=excluded.reading_level, language=excluded.language, topics=excluded.topics, model_used=excluded.model_used, cost_usd=excluded.cost_usd, created_at=excluded.created_at, published_at=excluded.published_at, record=excluded.record, indexed_at=excluded.indexed_at;
-  insert into news.article_locations (article_uri, idx, name, state, country, country_code, relevance, lat, lng, geom)
-  select p_article_uri, (ord-1)::int, loc->>'name', loc->>'state', loc->>'country', upper(nullif(loc->>'countryCode','')), loc->>'relevance', nullif(loc->>'lat','')::double precision, nullif(loc->>'lng','')::double precision, case when nullif(loc->>'lat','') is not null and nullif(loc->>'lng','') is not null then st_setsrid(st_makepoint((loc->>'lng')::double precision, (loc->>'lat')::double precision), 4326)::geography end
+  insert into news.article_locations (article_uri, idx, name, state, country, country_code, relevance, lat, lng)
+  select p_article_uri, (ord-1)::int, loc->>'name', loc->>'state', loc->>'country', upper(nullif(loc->>'countryCode','')), loc->>'relevance', nullif(loc->>'lat','')::double precision, nullif(loc->>'lng','')::double precision
   from jsonb_array_elements(v_rec->'locations') with ordinality as t(loc, ord) where jsonb_typeof(v_rec->'locations') = 'array';
   insert into news.article_entities (article_uri, kind, idx, name, entity_id, entity_id_type, role, sector, relevance, sentiment, sentiment_score)
   select p_article_uri, 'organization', (ord-1)::int, e->>'name', e->>'entityId', e->>'entityIdType', e->>'role', e->>'sector', e->>'relevance', e->>'sentiment', nullif(e->>'sentimentScore','')::numeric
@@ -514,8 +505,8 @@ begin
   from atproto.records r where r.collection = 'tech.transparencia.news.enrichment' and r.record->'article'->>'uri' is not null
   order by r.record->'article'->>'uri', r.indexed_at desc nulls last;
   update news.enrichments e set published_at = a.published_at from news.articles a where a.uri = e.article_uri;
-  insert into news.article_locations (article_uri, idx, name, state, country, country_code, relevance, lat, lng, geom)
-  select e.article_uri, (ord-1)::int, loc->>'name', loc->>'state', loc->>'country', upper(nullif(loc->>'countryCode','')), loc->>'relevance', nullif(loc->>'lat','')::double precision, nullif(loc->>'lng','')::double precision, case when nullif(loc->>'lat','') is not null and nullif(loc->>'lng','') is not null then st_setsrid(st_makepoint((loc->>'lng')::double precision, (loc->>'lat')::double precision), 4326)::geography end
+  insert into news.article_locations (article_uri, idx, name, state, country, country_code, relevance, lat, lng)
+  select e.article_uri, (ord-1)::int, loc->>'name', loc->>'state', loc->>'country', upper(nullif(loc->>'countryCode','')), loc->>'relevance', nullif(loc->>'lat','')::double precision, nullif(loc->>'lng','')::double precision
   from news.enrichments e, lateral jsonb_array_elements(e.record->'locations') with ordinality as t(loc, ord) where jsonb_typeof(e.record->'locations') = 'array';
   insert into news.article_entities (article_uri, kind, idx, name, entity_id, entity_id_type, role, sector, relevance, sentiment, sentiment_score)
   select e.article_uri, 'organization', (ord-1)::int, en->>'name', en->>'entityId', en->>'entityIdType', en->>'role', en->>'sector', en->>'relevance', en->>'sentiment', nullif(en->>'sentimentScore','')::numeric

@@ -3,7 +3,7 @@
  * Run once per schema change: docker compose run --rm migrate
  *
  * Order matters:
- *   1. atproto.records + postgis extension (source of truth + geo prerequisite)
+ *   1. atproto.records (source of truth)
  *   2. schema_news.sql (typed projection + trigger for news.* collections)
  *   3. schema_dof.sql  (typed projection + trigger for DOF collections)
  *
@@ -65,8 +65,6 @@ CREATE TABLE IF NOT EXISTS atproto.metadata (
   value TEXT NOT NULL,
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
-
-CREATE EXTENSION IF NOT EXISTS postgis;
 `;
 
 async function runStep(pool: ReturnType<typeof getPool>, label: string, sql: string) {
@@ -78,7 +76,7 @@ async function main() {
   console.log("Running migration...");
   const pool = getPool();
 
-  await runStep(pool, "atproto base + postgis", BASE_SQL);
+  await runStep(pool, "atproto base", BASE_SQL);
   await runStep(pool, "schema_news.sql", readFileSync(join(SQL_DIR, "schema_news.sql"), "utf8"));
   await runStep(pool, "schema_dof.sql",  readFileSync(join(SQL_DIR, "schema_dof.sql"),  "utf8"));
 

@@ -163,7 +163,6 @@ create table if not exists dof.note_locations (
   relevance    text,
   lat          double precision,
   lng          double precision,
-  geom         geography(Point, 4326),
   primary key (note_uri, idx)
 );
 
@@ -218,7 +217,6 @@ create index if not exists idx_dof_enr_fts_es on dof.enrichments
 create index if not exists idx_dof_loc_country       on dof.note_locations (country_code);
 create index if not exists idx_dof_loc_state         on dof.note_locations (lower(state));
 create index if not exists idx_dof_loc_relevance     on dof.note_locations (relevance);
-create index if not exists idx_dof_loc_geom          on dof.note_locations using gist (geom);
 
 create index if not exists idx_dof_ent_entity_id     on dof.note_entities (entity_id);
 create index if not exists idx_dof_ent_name          on dof.note_entities (lower(name));
@@ -409,13 +407,10 @@ begin
     published_at=excluded.published_at, record=excluded.record, indexed_at=excluded.indexed_at;
 
   insert into dof.note_locations (note_uri, idx, name, state, country,
-    country_code, relevance, lat, lng, geom)
+    country_code, relevance, lat, lng)
   select p_note_uri, (ord-1)::int, loc->>'name', loc->>'state', loc->>'country',
     upper(nullif(loc->>'countryCode','')), loc->>'relevance',
-    nullif(loc->>'lat','')::double precision, nullif(loc->>'lng','')::double precision,
-    case when nullif(loc->>'lat','') is not null and nullif(loc->>'lng','') is not null
-         then st_setsrid(st_makepoint((loc->>'lng')::double precision,
-                                      (loc->>'lat')::double precision), 4326)::geography end
+    nullif(loc->>'lat','')::double precision, nullif(loc->>'lng','')::double precision
   from jsonb_array_elements(v_rec->'locations') with ordinality as t(loc, ord)
   where jsonb_typeof(v_rec->'locations') = 'array';
 
@@ -590,13 +585,10 @@ begin
   from dof.notes n where n.uri = e.note_uri;
 
   insert into dof.note_locations (note_uri, idx, name, state, country,
-    country_code, relevance, lat, lng, geom)
+    country_code, relevance, lat, lng)
   select e.note_uri, (ord-1)::int, loc->>'name', loc->>'state', loc->>'country',
     upper(nullif(loc->>'countryCode','')), loc->>'relevance',
-    nullif(loc->>'lat','')::double precision, nullif(loc->>'lng','')::double precision,
-    case when nullif(loc->>'lat','') is not null and nullif(loc->>'lng','') is not null
-         then st_setsrid(st_makepoint((loc->>'lng')::double precision,
-                                      (loc->>'lat')::double precision), 4326)::geography end
+    nullif(loc->>'lat','')::double precision, nullif(loc->>'lng','')::double precision
   from dof.enrichments e,
        lateral jsonb_array_elements(e.record->'locations') with ordinality as t(loc, ord)
   where jsonb_typeof(e.record->'locations') = 'array';
