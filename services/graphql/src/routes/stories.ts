@@ -25,18 +25,25 @@ function json(res: ServerResponse, body: unknown, status = 200, extraHeaders: Re
   res.end(JSON.stringify(body));
 }
 
-async function listStories(pool: pg.Pool, q: string | undefined, limit: number) {
-  const filter = q
-    ? `AND (best_title ILIKE $1 OR EXISTS (SELECT 1 FROM unnest(top_topics) t WHERE t ILIKE $1))`
-    : "";
-  const params: (string | number)[] = q ? [`%${q}%`, limit] : [limit];
-  const limitPh = q ? "$2" : "$1";
+async function listStories(pool: pg.Pool, q: string | undefined, limit: number, offset: number) {
+  // No size filter — surfacing singletons too so the user can browse past the
+  // "most-covered" head. Sort keeps multi-article stories first naturally.
+  const params: (string | number)[] = [];
+  const clauses: string[] = [];
+  if (q) {
+    params.push(`%${q}%`);
+    clauses.push(`(best_title ILIKE $${params.length} OR EXISTS (SELECT 1 FROM unnest(top_topics) t WHERE t ILIKE $${params.length}))`);
+  }
+  params.push(limit);
+  const limitPh = `$${params.length}`;
+  params.push(offset);
+  const offsetPh = `$${params.length}`;
   const { rows } = await pool.query(
     `SELECT story_id, size, first_seen, last_seen, sample_titles, best_title, top_topics
        FROM atproto.stories
-      WHERE size > 1 ${filter}
+      ${clauses.length ? `WHERE ${clauses.join(" AND ")}` : ""}
       ORDER BY size DESC, last_seen DESC
-      LIMIT ${limitPh}`,
+      LIMIT ${limitPh} OFFSET ${offsetPh}`,
     params,
   );
   return rows;
@@ -109,9 +116,11 @@ export async function handleStoriesRoute(
     const q = url.searchParams.get("q")?.trim() || undefined;
     const limitRaw = Number(url.searchParams.get("limit") ?? 50);
     const limit = Math.min(200, Math.max(1, Number.isFinite(limitRaw) ? limitRaw : 50));
+    const offsetRaw = Number(url.searchParams.get("offset") ?? 0);
+    const offset = Math.max(0, Number.isFinite(offsetRaw) ? offsetRaw : 0);
 
-    const [statsRow, stories] = await Promise.all([stats(pool), listStories(pool, q, limit)]);
-    return json(res, { stats: statsRow, stories });
+    const [statsRow, stories] = await Promise.all([stats(pool), listStories(pool, q, limit, offset)]);
+    return json(res, { stats: statsRow, stories, limit, offset });
   } catch (err) {
     json(res, { error: (err as Error).message }, 500);
   }
