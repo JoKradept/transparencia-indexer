@@ -118,6 +118,68 @@ BEGIN
     END IF;
   END LOOP;
 
+  -- Refresh the materialized stories table so /historias (and future search)
+  -- reads one indexed table instead of aggregating article_story + news.articles.
+  PERFORM atproto.rebuild_stories();
+
   RETURN QUERY SELECT cnt_processed, cnt_skipped, cnt_new, cnt_joined;
 END;
 $$ LANGUAGE plpgsql;
+-- Materialized `stories` table: one row per story_id with pre-aggregated
+-- size, timeline, top entities, and headline sample. Kept in sync by
+-- atproto.cluster_stories() (which calls rebuild_stories() at the end),
+-- so consumers query one indexed table instead of aggregating 29k rows
+-- across article_story + news.articles on every request.
+
+CREATE TABLE IF NOT EXISTS atproto.stories (
+  story_id       text PRIMARY KEY,
+  size           int NOT NULL,
+  first_seen     timestamptz NOT NULL,
+  last_seen      timestamptz NOT NULL,
+  sample_titles  text[] NOT NULL,   -- top 3 by created_at DESC
+  best_title     text,              -- freshest article title
+  top_topics     text[] NOT NULL,   -- union of all article entity_bags (dedup)
+  computed_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_stories_size        ON atproto.stories (size DESC);
+CREATE INDEX IF NOT EXISTS idx_stories_last_seen   ON atproto.stories (last_seen DESC);
+-- Search: filter stories by topic / person / org via && operator on top_topics.
+CREATE INDEX IF NOT EXISTS idx_stories_topics_gin  ON atproto.stories USING gin (top_topics);
+
+-- Full rebuild. Cheap enough (~20k stories) to run every timer tick alongside
+-- cluster_stories(). Orphans in article_story (article_uri no longer in
+-- news.articles after Fase 3b cleanup) drop out via the inner JOIN.
+CREATE OR REPLACE FUNCTION atproto.rebuild_stories() RETURNS int AS $$
+DECLARE n int;
+BEGIN
+  TRUNCATE atproto.stories;
+
+  WITH story_topics AS (
+    SELECT story_id, array_agg(DISTINCT elem ORDER BY elem) AS top_topics
+    FROM (
+      SELECT story_id, unnest(entity_bag) AS elem FROM atproto.article_story
+    ) t
+    GROUP BY story_id
+  ),
+  story_base AS (
+    SELECT s.story_id,
+           COUNT(*)::int                                              AS size,
+           MIN(s.created_at)                                          AS first_seen,
+           MAX(s.created_at)                                          AS last_seen,
+           (array_agg(a.title ORDER BY s.created_at DESC))[1:3]       AS sample_titles,
+           (array_agg(a.title ORDER BY s.created_at DESC))[1]         AS best_title
+    FROM atproto.article_story s
+    JOIN news.articles a ON a.uri = s.article_uri
+    GROUP BY s.story_id
+  )
+  INSERT INTO atproto.stories
+    (story_id, size, first_seen, last_seen, sample_titles, best_title, top_topics, computed_at)
+  SELECT b.story_id, b.size, b.first_seen, b.last_seen, b.sample_titles, b.best_title,
+         COALESCE(t.top_topics, '{}'::text[]), now()
+  FROM story_base b
+  LEFT JOIN story_topics t USING (story_id);
+
+  GET DIAGNOSTICS n = ROW_COUNT;
+  RETURN n;
+END $$ LANGUAGE plpgsql;
