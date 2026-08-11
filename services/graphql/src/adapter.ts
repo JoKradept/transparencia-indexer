@@ -59,9 +59,26 @@ function loadLexicons(lexiconDir?: string) {
 }
 
 /**
+ * Resolve a lex-gql field name to a SQL column reference for the current source.
+ * Returns null when the field would be a no-op on the source (e.g. sorting by
+ * `collection` on a single-collection typed table). `uriCol` differs on
+ * enrichment tables where the PK is article_uri / note_uri.
+ */
+function resolveColumn(
+  field: string,
+  collection: string | null,
+  usingTyped: boolean,
+  uriCol: string
+): string | null {
+  if (field === "uri") return uriCol;
+  if (field === "did" || field === "cid") return field;
+  if (field === "indexedAt") return "indexed_at";
+  if (field === "collection") return usingTyped ? null : "collection";
+  return `record->>'${field}'`;
+}
+
+/**
  * Build SQL WHERE clause from lex-gql where conditions.
- * `uriCol` is the column that holds the record's AT-URI on the source table
- * (differs on enrichment tables where the PK is article_uri / note_uri).
  */
 function buildWhereClause(
   where: any[],
@@ -79,15 +96,6 @@ function buildWhereClause(
     conditions.push(`collection = $${params.length}`);
   }
 
-  const resolveColumn = (field: string): string => {
-    if (field === "uri") return uriCol;
-    if (field === "did") return "did";
-    if (field === "cid") return "cid";
-    if (field === "indexedAt") return "indexed_at";
-    if (field === "collection") return usingTyped ? `'${collection}'` : "collection";
-    return `record->>'${field}'`;
-  };
-
   for (const clause of where) {
     if (clause.op === "and" || clause.op === "or") {
       const subclauses = clause.conditions.map((group: any[]) => {
@@ -99,7 +107,8 @@ function buildWhereClause(
     }
 
     const { field, op, value } = clause;
-    const column = resolveColumn(field);
+    const column = resolveColumn(field, collection, usingTyped, uriCol);
+    if (!column) continue; // no-op field (e.g. collection filter on typed table)
 
     switch (op) {
       case "eq":
@@ -136,19 +145,23 @@ function buildWhereClause(
   return conditions.length > 0 ? conditions.join(" AND ") : "TRUE";
 }
 
-function buildOrderBy(sort?: any[], usingTyped = false, uriCol = "uri"): string {
+function buildOrderBy(
+  sort?: any[],
+  collection: string | null = null,
+  usingTyped = false,
+  uriCol = "uri",
+): string {
   if (!sort || sort.length === 0) return "ORDER BY indexed_at DESC";
 
-  const clauses = sort.map((s) => {
-    let column: string;
-    if (s.field === "uri") column = uriCol;
-    else if (s.field === "indexedAt") column = "indexed_at";
-    else if (["did", "cid"].includes(s.field)) column = s.field;
-    else if (s.field === "collection" && usingTyped) column = "'*'"; // no-op
-    else column = `record->>'${s.field}'`;
-    return `${column} ${s.dir === "asc" ? "ASC" : "DESC"}`;
-  });
-  return `ORDER BY ${clauses.join(", ")}`;
+  const clauses = sort
+    .map((s) => {
+      const column = resolveColumn(s.field, collection, usingTyped, uriCol);
+      if (!column) return null;
+      return `${column} ${s.dir === "asc" ? "ASC" : "DESC"}`;
+    })
+    .filter((c): c is string => c !== null);
+
+  return clauses.length ? `ORDER BY ${clauses.join(", ")}` : "ORDER BY indexed_at DESC";
 }
 
 /**
@@ -199,7 +212,7 @@ export async function createAdapter(options?: { lexiconDir?: string }): Promise<
         const fromClause = typed ? typed.from : "atproto.records";
 
         const whereClause = buildWhereClause(where, collection, params, usingTyped, uriCol);
-        const orderBy = buildOrderBy(sort, usingTyped, uriCol);
+        const orderBy = buildOrderBy(sort, collection, usingTyped, uriCol);
 
         const limit = (pagination.first || pagination.last || 50) + 1;
         params.push(limit);
