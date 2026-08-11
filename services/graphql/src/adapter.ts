@@ -33,7 +33,7 @@ type TypedSource = {
   uriColumn: string;
 };
 
-// ponytail: keep in sync with services/indexer/src/db.ts (TYPED_COLLECTIONS).
+// Keep in sync with services/indexer/src/db.ts (TYPED_COLLECTIONS).
 const TYPED_TABLES: Record<string, TypedSource> = {
   "tech.transparencia.news.source":                       { from: "news.sources",     uriColumn: "uri" },
   "tech.transparencia.news.article":                      { from: "news.articles",    uriColumn: "uri" },

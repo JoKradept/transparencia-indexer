@@ -397,9 +397,9 @@ begin
   where jsonb_typeof(e.record->'people') = 'array';
 end $$;
 
--- ponytail: dropped Supabase RLS + anon/authenticated grants — indexer Postgres
--- has no external clients; reads go through the GraphQL service which uses the
--- shared transparencia role.
+-- Dropped Supabase RLS + anon/authenticated grants — indexer Postgres has no
+-- external clients; reads go through the GraphQL service which uses the shared
+-- transparencia role.
 
 -- ============================================================================
 -- v2: denormalize published_at onto news.enrichments

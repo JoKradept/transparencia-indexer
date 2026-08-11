@@ -21,7 +21,7 @@ export function getPool(): pg.Pool {
   if (!pool) {
     pool = new Pool({
       connectionString: process.env.DATABASE_URL,
-      // ponytail: 8 conns covers 1 batch flush + a few concurrent reads.
+      // 8 conns covers 1 batch flush + a few concurrent reads.
       max: 8,
       idleTimeoutMillis: 30000,
     });
